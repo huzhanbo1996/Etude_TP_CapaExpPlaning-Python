@@ -11,6 +11,135 @@ from pyomo.opt import SolverFactory
 
 from functions.f_optimization import *
 
+def GetEVModel(areaConsumption,availabilityFactor,TechParameters,EVConsumption,chargeCapacity,isAbstract=False):
+
+    #isAbstract=False
+    availabilityFactor.isna().sum()
+    
+    ### Cleaning
+    availabilityFactor=availabilityFactor.fillna(method='pad');
+    areaConsumption=areaConsumption.fillna(method='pad');
+    
+    ### obtaining dimensions values 
+    TECHNOLOGIES=   set(TechParameters.index.get_level_values('TECHNOLOGIES').unique())
+    TIMESTAMP=      set(areaConsumption.index.get_level_values('TIMESTAMP').unique())
+    TIMESTAMP_list= areaConsumption.index.get_level_values('TIMESTAMP').unique()
+    DAYSTAMP=       set(EVConsumption.index.unique())
+    
+    #####################
+    #    Pyomo model    #
+    #####################
+
+    if (isAbstract) : 
+        model = AbstractModel()
+    else:
+        model = ConcreteModel() 
+        
+    ###############
+    # Sets       ##
+    ###############
+    model.TECHNOLOGIES = Set(initialize=TECHNOLOGIES,ordered=False)
+    model.TIMESTAMP = Set(initialize=TIMESTAMP,ordered=False)
+    model.DAYSTAMP = Set(initialize=DAYSTAMP,ordered=False)
+    model.TIMESTAMP_TECHNOLOGIES =  model.TIMESTAMP *model.TECHNOLOGIES
+
+    #Subset of Simple only required if ramp constraint
+    model.TIMESTAMP_MinusOne = Set(initialize=TIMESTAMP_list[: len(TIMESTAMP) - 1],ordered=False)
+    model.TIMESTAMP_MinusThree = Set(initialize=TIMESTAMP_list[: len(TIMESTAMP) - 3],ordered=False)
+    
+    
+    ###############
+    # Parameters ##
+    ###############
+    
+    model.areaConsumption =     Param(model.TIMESTAMP, mutable=True,
+                                      initialize=areaConsumption.loc[:,"areaConsumption"].squeeze().to_dict(), domain=Any)
+    model.availabilityFactor =  Param( model.TIMESTAMP_TECHNOLOGIES, domain=PercentFraction,default=1,
+                                      initialize=availabilityFactor.loc[:,"availabilityFactor"].squeeze().to_dict())
+    model.EVConsumption =       Param(model.TIMESTAMP, mutable=True,
+                                      initialize=EVConsumption.loc[:,"areaConsumption"].squeeze().to_dict(), domain=Any)                                
+    model.chargeCapacity =      Param(model.TIMESTAMP, mutable=True,
+                                      initialize=chargeCapacity.loc[:,"areaConsumption"].squeeze().to_dict(), domain=Any) 
+    
+    #with test of existing columns on TechParameters
+    for COLNAME in TechParameters:
+        if COLNAME not in ["TECHNOLOGIES","AREAS"]: ### each column in TechParameters will be a parameter
+            exec("model."+COLNAME+" =          Param(model.TECHNOLOGIES, domain=NonNegativeReals,default=0,"+
+                                      "initialize=TechParameters."+COLNAME+".squeeze().to_dict())")
+    ## manière générique d'écrire pour toutes les colomnes COL de TechParameters quelque chose comme 
+    # model.COLNAME =          Param(model.TECHNOLOGIES, domain=NonNegativeReals,default=0,
+    #                                  initialize=TechParameters.set_index([ "TECHNOLOGIES"]).COLNAME.squeeze().to_dict())
+    
+    ################
+    # Variables    #
+    ################
+    
+   
+    model.energy=Var(model.TIMESTAMP, model.TECHNOLOGIES, domain=NonNegativeReals) ### Energy produced by a production mean at time t
+    model.EVenergy=Var(model.TIMESTAMP, domain=NonNegativeReals)
+    model.energyCosts=Var(model.TECHNOLOGIES)  ### Cost of energy for a production mean, explicitely defined by definition energyCostsDef    
+    model.capacityCosts=Var(model.TECHNOLOGIES)  ### Cost of energy for a production mean, explicitely defined by definition energyCostsDef    
+    model.capacity=Var(model.TECHNOLOGIES, domain=NonNegativeReals) ### Energy produced by a production mean at time t
+    
+    model.dual = Suffix(direction=Suffix.IMPORT)
+    model.rc = Suffix(direction=Suffix.IMPORT)
+    model.slack = Suffix(direction=Suffix.IMPORT)
+    
+    ########################
+    # Objective Function   #
+    ########################
+    
+    def ObjectiveFunction_rule(model): #OBJ
+    	return sum(model.energyCosts[tech]+model.capacityCosts[tech]  for tech in model.TECHNOLOGIES)
+    model.OBJ = Objective(rule=ObjectiveFunction_rule, sense=minimize)
+    
+    
+    #################
+    # Constraints   #
+    #################
+    
+    
+    # energyCosts definition Constraints       
+    def energyCostsDef_rule(model,tech): #EQ forall tech in TECHNOLOGIES   energyCosts  = sum{t in TIMESTAMP} energyCost[tech]*energy[t,tech] / 1E6;
+        temp=model.energyCost[tech]#/10**6 ;
+        return sum(temp*model.energy[t,tech] for t in model.TIMESTAMP) == model.energyCosts[tech]
+    model.energyCostsCtr = Constraint(model.TECHNOLOGIES, rule=energyCostsDef_rule)    
+    
+    # capacityCosts definition Constraints
+    def capacityCostsDef_rule(model,tech): #EQ forall tech in TECHNOLOGIES   energyCosts  = sum{t in TIMESTAMP} energyCost[tech]*energy[t,tech] / 1E6;
+        temp=model.capacityCosts[tech]#/10**6 ;
+        return model.capacityCost[tech]*model.capacity[tech] == model.capacityCosts[tech]
+        #return model.capacityCost[tech] * len(model.TIMESTAMP) / 8760 * model.capacity[tech] / 10 ** 6 == model.capacityCosts[tech]
+
+    model.capacityCostsCtr = Constraint(model.TECHNOLOGIES, rule=capacityCostsDef_rule)    
+
+
+    
+    #Capacity constraint
+    def Capacity_rule(model,t,tech): #INEQ forall t, tech 
+    	return model.capacity[tech] * model.availabilityFactor[t,tech] >= model.energy[t,tech]
+    model.CapacityCtr = Constraint(model.TIMESTAMP,model.TECHNOLOGIES, rule=Capacity_rule)    
+    
+    #contrainte de stock annuel 
+
+    
+    #contrainte d'equilibre offre demande 
+    def energyCtr_rule(model,t): #INEQ forall t
+    	return sum(model.energy[t,tech] for tech in model.TECHNOLOGIES ) >= model.areaConsumption[t] + model.EVenergy[t]
+    model.energyCtr = Constraint(model.TIMESTAMP,rule=energyCtr_rule)
+
+    BY_HOURS = 24
+    #EV energy used by day 
+    def EVenergyCtr_rule(model,t): #INEQ forall t
+        return sum(model.EVenergy[timestamp+1] for timestamp in range((t-1)*BY_HOURS,(t-1)*BY_HOURS+BY_HOURS) ) >= model.EVConsumption[t]
+    model.EVenergyCtr = Constraint(model.DAYSTAMP,rule=EVenergyCtr_rule)
+
+    def EVCapacityCtr_rule(model,t): #INEQ forall t, tech 
+    	return model.EVenergy[t] <= model.chargeCapacity[t]
+    model.EVCapacityCtr = Constraint(model.TIMESTAMP, rule=EVCapacityCtr_rule) 
+
+    return model
+
 def GetElectricSystemModel_PlaningSingleNode(areaConsumption,availabilityFactor,TechParameters,isAbstract=False):
 
     #isAbstract=False
